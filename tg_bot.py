@@ -12,8 +12,11 @@ import sys
 import io
 import asyncio
 import logging
+from datetime import time as dt_time
 from functools import wraps
 from contextlib import redirect_stdout
+
+import pytz
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -257,7 +260,59 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
-# ── Scheduler (Task 5) will go here ──
+async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
+    """Run watchdog and send alerts to the user. Called by JobQueue on schedule."""
+    try:
+        from watchdog import (
+            load_portfolio, check_price_moves, check_volume,
+            check_macro_shift, check_news, check_rebalance,
+            check_portfolio_status,
+        )
+
+        portfolio = load_portfolio()
+        if not portfolio["positions"]:
+            return  # no portfolio, nothing to alert on
+
+        all_alerts = []
+        all_alerts.extend(check_price_moves(portfolio))
+        all_alerts.extend(check_volume(portfolio))
+
+        macro_alerts, _ = check_macro_shift()
+        all_alerts.extend(macro_alerts)
+        all_alerts.extend(check_news(portfolio))
+        all_alerts.extend(check_rebalance(portfolio))
+
+        if not all_alerts:
+            return  # no alerts, stay silent
+
+        # Build summary
+        _, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
+
+        lines = [
+            "Daily Watchdog Alert\n",
+            f"Portfolio: ${total_value:>,.2f} ({total_pnl_pct:>+.1f}%)\n",
+        ]
+
+        critical = [a for a in all_alerts if "CRITICAL" in a[0]]
+        warnings = [a for a in all_alerts if "WARNING" in a[0]]
+        infos = [a for a in all_alerts if "INFO" in a[0]]
+
+        for a in critical + warnings + infos:
+            lines.append(f"{a[0]} [{a[1]}] {a[2]}")
+
+        if critical:
+            lines.append(f"\n{len(critical)} CRITICAL alert(s) - ACTION REQUIRED!")
+
+        await context.bot.send_message(
+            chat_id=TELEGRAM_USER_ID,
+            text="\n".join(lines),
+        )
+    except Exception as e:
+        logger.error(f"Scheduled watchdog error: {e}")
+        await context.bot.send_message(
+            chat_id=TELEGRAM_USER_ID,
+            text=f"Watchdog error: {e}",
+        )
 
 
 @auth
@@ -296,7 +351,15 @@ def main():
     app.add_handler(CommandHandler("macro", cmd_macro))
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
-    # Scheduler will be set up in Task 5
+    # Schedule watchdog at 8:30 AM ET, Monday-Friday
+    et = pytz.timezone("US/Eastern")
+    app.job_queue.run_daily(
+        scheduled_watchdog,
+        time=dt_time(hour=8, minute=30, tzinfo=et),
+        days=(0, 1, 2, 3, 4),  # Monday=0 through Friday=4
+        name="daily_watchdog",
+    )
+    logger.info("Scheduled daily watchdog at 8:30 AM ET, Mon-Fri")
 
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
