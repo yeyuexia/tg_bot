@@ -228,7 +228,35 @@ async def cmd_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
-# ── Chat handler (Task 4) will go here ──
+@auth
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward natural language messages to Claude Code CLI."""
+    user_msg = update.message.text
+    if not user_msg:
+        return
+
+    await update.message.reply_text("Thinking...")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--print", "-p", user_msg,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=os.path.abspath(WORK_DIR),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        response = stdout.decode().strip()
+        if not response:
+            response = f"(no output)\nstderr: {stderr.decode().strip()}"
+        await send_long_message(update, response)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Claude timed out after 2 minutes.")
+    except FileNotFoundError:
+        await update.message.reply_text(
+            "Claude CLI not found. Make sure 'claude' is in PATH."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
 # ── Scheduler (Task 5) will go here ──
 
 
@@ -267,7 +295,7 @@ def main():
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("macro", cmd_macro))
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
-    # Chat handler will be added in Task 4
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
     # Scheduler will be set up in Task 5
 
     logger.info("Bot starting...")
