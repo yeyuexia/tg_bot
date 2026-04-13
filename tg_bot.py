@@ -10,6 +10,7 @@ Usage:
 import os
 import sys
 import io
+import json
 import asyncio
 import logging
 from datetime import time as dt_time
@@ -34,6 +35,9 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
 STOCK_DIR = os.path.join(os.path.dirname(__file__), "..", "stock")
 WORK_DIR = os.path.join(os.path.dirname(__file__), "..")
+
+# Track Claude session per Telegram user for conversation continuity
+_claude_sessions = {}  # user_id -> session_id
 
 # Add stock dir to path so we can import its modules
 sys.path.insert(0, os.path.abspath(STOCK_DIR))
@@ -232,27 +236,154 @@ async def cmd_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @auth
+async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Fetching latest political forecast...")
+    try:
+        sys.path.insert(0, os.path.abspath(STOCK_DIR))
+        from forecast import get_latest_political_score
+        from news_store import init_db, get_latest_analysis
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            init_db()
+            return get_latest_analysis()
+
+        _, latest = await loop.run_in_executor(None, capture_stdout, _run)
+        if not latest:
+            await update.message.reply_text("No forecast yet. Start news_poller.py first.")
+            return
+
+        sectors = latest.get("sector_impacts", {})
+        sector_lines = "\n".join(
+            f"  {t}: {d}" for t, d in list(sectors.items())[:8]
+        )
+        lines = [
+            f"Political Briefing [{latest['trigger'].upper()}]",
+            f"Time: {latest['created_at']} UTC",
+            f"Risk Score: {latest['political_risk_score']:+.2f}\n",
+            latest.get("briefing", ""),
+            "",
+            f"Sector Impacts:\n{sector_lines}" if sector_lines else "",
+        ]
+        await send_long_message(update, "\n".join(l for l in lines if l is not None))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+@auth
+async def cmd_hotspots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Checking recent hotspot alerts...")
+    try:
+        import datetime as dt
+        from news_store import init_db, _get_conn
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            init_db()
+            cutoff = (dt.datetime.utcnow() - dt.timedelta(hours=24)).isoformat()
+            with _get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM llm_analyses WHERE trigger='hotspot' AND created_at > ? "
+                    "ORDER BY created_at DESC",
+                    (cutoff,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+        _, rows = await loop.run_in_executor(None, capture_stdout, _run)
+        if not rows:
+            await update.message.reply_text("No hotspot alerts in the last 24h.")
+            return
+
+        lines = ["Hotspot Alerts (last 24h):\n"]
+        for r in rows:
+            lines.append(
+                f"[{r['created_at']}] {r['category'].upper()} "
+                f"risk:{r['political_risk_score']:+.2f}"
+            )
+            lines.append(f"  {r['briefing'][:100]}\n")
+        await send_long_message(update, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+@auth
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward natural language messages to Claude Code CLI."""
     user_msg = update.message.text
     if not user_msg:
         return
 
-    await update.message.reply_text("Thinking...")
+    # /new resets the conversation
+    if user_msg.strip().lower() == "/new":
+        _claude_sessions.pop(update.effective_user.id, None)
+        await update.message.reply_text("Started a new conversation.")
+        return
+
+    thinking_msg = await update.message.reply_text("Thinking...")
+    proc = None
     try:
+        user_id = update.effective_user.id
+        session_id = _claude_sessions.get(user_id)
+
+        cmd = ["claude", "--print", "--max-turns", "200",
+               "--output-format", "json",
+               "--model", "sonnet",
+               "--dangerously-skip-permissions",
+               "--add-dir", os.path.expanduser("~/works"),
+               "--append-system-prompt",
+               "Be efficient: batch multiple independent tool calls in a single turn. "
+               "For example, read multiple files at once, or make multiple edits at once. "
+               "Minimize total turns used."]
+        if session_id:
+            cmd += ["--resume", session_id, "-p", user_msg]
+        else:
+            cmd += ["-p", user_msg]
+
         proc = await asyncio.create_subprocess_exec(
-            "claude", "--print", "-p", user_msg,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.path.abspath(WORK_DIR),
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        response = stdout.decode().strip()
+        elapsed = 0
+        interval = 30
+        while True:
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=interval,
+                )
+                break  # process finished
+            except asyncio.TimeoutError:
+                elapsed += interval
+                if elapsed >= 1800:
+                    raise  # real timeout — give up after 30 min
+                mins = elapsed // 60
+                secs = elapsed % 60
+                dots = "." * ((elapsed // interval) % 3 + 1)
+                time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+                await thinking_msg.edit_text(f"Still thinking{dots} ({time_str})")
+
+        raw = stdout.decode().strip()
+        # Parse JSON output to extract session_id for continuity
+        response = raw
+        try:
+            data = json.loads(raw)
+            response = data.get("result", raw)
+            sid = data.get("session_id", "")
+            if sid:
+                _claude_sessions[user_id] = sid
+        except (json.JSONDecodeError, AttributeError):
+            pass  # fallback to raw text
+
         if not response:
             response = f"(no output)\nstderr: {stderr.decode().strip()}"
+        await thinking_msg.delete()
         await send_long_message(update, response)
     except asyncio.TimeoutError:
-        await update.message.reply_text("Claude timed out after 2 minutes.")
+        if proc:
+            proc.kill()
+            await proc.wait()
+        await thinking_msg.edit_text("Claude timed out after 30 minutes.")
     except FileNotFoundError:
         await update.message.reply_text(
             "Claude CLI not found. Make sure 'claude' is in PATH."
@@ -307,6 +438,24 @@ async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
             chat_id=TELEGRAM_USER_ID,
             text="\n".join(lines),
         )
+
+        # Push political forecast briefing if available
+        try:
+            import datetime as _dt
+            from news_store import init_db as _init_db, get_latest_analysis
+            from tg_notifier import send_scheduled_briefing
+            _init_db()
+            latest = get_latest_analysis()
+            if latest:
+                hour = _dt.datetime.now(tz=pytz.timezone("US/Eastern")).hour
+                label = (
+                    "PRE-MARKET BRIEFING" if hour < 10 else
+                    "MIDDAY BRIEFING" if hour < 15 else
+                    "AFTER-HOURS BRIEFING"
+                )
+                send_scheduled_briefing(latest, label=label)
+        except Exception as _e:
+            logger.error(f"Forecast push error: {_e}")
     except Exception as e:
         logger.error(f"Scheduled watchdog error: {e}")
         await context.bot.send_message(
@@ -325,6 +474,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/screen - Value+quality stock screener\n"
         "/macro - Macro regime analysis\n"
         "/sentiment - News & social sentiment\n"
+        "/forecast - Latest political briefing\n"
+        "/hotspots - Recent severity-3 alerts (24h)\n"
         "/help - Show this message\n"
         "\nOr just send any message to chat with Claude."
     )
@@ -350,16 +501,22 @@ def main():
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("macro", cmd_macro))
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
+    app.add_handler(CommandHandler("forecast", cmd_forecast))
+    app.add_handler(CommandHandler("hotspots", cmd_hotspots))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
-    # Schedule watchdog at 8:30 AM ET, Monday-Friday
     et = pytz.timezone("US/Eastern")
-    app.job_queue.run_daily(
-        scheduled_watchdog,
-        time=dt_time(hour=8, minute=30, tzinfo=et),
-        days=(0, 1, 2, 3, 4),  # Monday=0 through Friday=4
-        name="daily_watchdog",
-    )
-    logger.info("Scheduled daily watchdog at 8:30 AM ET, Mon-Fri")
+    schedule_times = [
+        dt_time(hour=8,  minute=10, tzinfo=et),   # pre-market
+        dt_time(hour=12, minute=30, tzinfo=et),   # midday
+        dt_time(hour=17, minute=0,  tzinfo=et),   # after-hours
+    ]
+    for t in schedule_times:
+        app.job_queue.run_daily(
+            scheduled_watchdog,
+            time=t,
+            days=(0, 1, 2, 3, 4),
+        )
+    logger.info("Scheduled watchdog at 8:10, 12:30, 17:00 ET Mon-Fri")
 
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
