@@ -117,10 +117,43 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_watchdog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Running watchdog...")
     try:
-        from watchdog import run_watchdog
+        from watchdog import (
+            load_portfolio, check_price_moves, check_volume,
+            check_macro_shift, check_news, check_rebalance,
+            check_portfolio_status,
+        )
         loop = asyncio.get_event_loop()
-        output, _ = await loop.run_in_executor(None, capture_stdout, run_watchdog, False)
-        await send_long_message(update, output or "Watchdog completed (no output).")
+
+        def _run():
+            portfolio = load_portfolio()
+            if not portfolio["positions"]:
+                return None, None, None, None, None, None, None
+            all_alerts = []
+            all_alerts.extend(check_price_moves(portfolio))
+            all_alerts.extend(check_volume(portfolio))
+            macro_alerts, macro_result = check_macro_shift()
+            all_alerts.extend(macro_alerts)
+            all_alerts.extend(check_news(portfolio))
+            all_alerts.extend(check_rebalance(portfolio))
+            rows, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
+            pos_by_ticker = {r["ticker"]: r for r in rows}
+            return portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash
+
+        _, result = await loop.run_in_executor(None, capture_stdout, _run)
+        portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash = result
+
+        if portfolio is None:
+            await update.message.reply_text("No portfolio found.")
+            return
+        if not all_alerts:
+            await update.message.reply_text("All clear. No actionable alerts.")
+            return
+
+        text = _build_watchdog_message(
+            portfolio, all_alerts, pos_by_ticker,
+            macro_result, total_value, total_pnl, total_pnl_pct, cash,
+        )
+        await send_long_message(update, text)
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -391,6 +424,79 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
+def _build_watchdog_message(portfolio, all_alerts, pos_by_ticker,
+                             macro_result, total_value, total_pnl, total_pnl_pct, cash):
+    """Build a detailed, human-readable watchdog alert message."""
+    import datetime as _dt
+
+    et = pytz.timezone("US/Eastern")
+    now_et = _dt.datetime.now(tz=et)
+    hour = now_et.hour
+    session = (
+        "Pre-Market" if hour < 10 else
+        "Midday"     if hour < 15 else
+        "After-Hours"
+    )
+    date_str = now_et.strftime("%a %b %-d")
+
+    critical = [a for a in all_alerts if "CRITICAL" in a[0]]
+    warnings  = [a for a in all_alerts if "WARNING"  in a[0]]
+    infos     = [a for a in all_alerts if "INFO"     in a[0]]
+
+    pnl_sign = "+" if total_pnl >= 0 else ""
+    lines = [
+        f"Watchdog | {session} | {date_str}",
+        "",
+        f"Portfolio  ${total_value:>9,.2f}  {pnl_sign}${total_pnl:,.2f} ({total_pnl_pct:+.1f}%)",
+        f"Cash       ${cash:>9,.2f}",
+    ]
+
+    def _fmt_section(alerts, icon, label):
+        if not alerts:
+            return
+        lines.append(f"\n{icon} {label} ({len(alerts)})")
+        lines.append("─" * 32)
+        for lvl, ticker, msg in alerts:
+            pos = pos_by_ticker.get(ticker)
+            lines.append(f"{ticker}")
+            lines.append(f"  {msg}")
+            # Add position context for stock/ETF tickers
+            if pos:
+                lines.append(
+                    f"  Entry ${pos['entry']:.2f} | Now ${pos['current']:.2f} | "
+                    f"P&L {pos['pnl_pct']:+.1f}% (${pos['pnl']:+,.2f})"
+                )
+            # Add action guidance for critical price/stop alerts
+            if "CRITICAL" in lvl:
+                if "STOP-LOSS" in msg or "TRAILING STOP" in msg:
+                    lines.append("  >> Action: Review position — consider selling to limit loss")
+                elif "Moved" in msg:
+                    direction = "recovering" if "+" in msg else "falling"
+                    lines.append(f"  >> Large move — monitor closely, price {direction}")
+                elif "Regime change" in msg:
+                    lines.append("  >> Action: Re-run system: python3 run.py")
+                elif "SAHM RULE" in msg:
+                    lines.append("  >> Recession signal — reduce equity exposure, increase cash/bonds")
+                elif "Yield curve" in msg:
+                    lines.append("  >> Defensive posture — favour TLT/BIL/SHY over growth")
+
+    _fmt_section(critical, "🔴", "CRITICAL")
+    _fmt_section(warnings,  "🟡", "WARNING")
+    _fmt_section(infos,     "🟢", "INFO")
+
+    # Macro footer
+    lines.append("\n" + "─" * 32)
+    if macro_result:
+        score = macro_result["score"]
+        regime = macro_result["regime"].upper()
+        lines.append(f"Macro: {regime}  score {score:+.2f}")
+
+    next_hour = "12:30 PM" if hour < 12 else "5:00 PM" if hour < 17 else "8:10 AM tomorrow"
+    lines.append(f"Next check: {next_hour} ET")
+
+    return "\n".join(lines)
+
+
 async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
     """Run watchdog and send alerts to the user. Called by JobQueue on schedule."""
     try:
@@ -408,7 +514,7 @@ async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
         all_alerts.extend(check_price_moves(portfolio))
         all_alerts.extend(check_volume(portfolio))
 
-        macro_alerts, _ = check_macro_shift()
+        macro_alerts, macro_result = check_macro_shift()
         all_alerts.extend(macro_alerts)
         all_alerts.extend(check_news(portfolio))
         all_alerts.extend(check_rebalance(portfolio))
@@ -416,28 +522,14 @@ async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
         if not all_alerts:
             return  # no alerts, stay silent
 
-        # Build summary
-        _, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
+        rows, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
+        pos_by_ticker = {r["ticker"]: r for r in rows}
 
-        lines = [
-            "Daily Watchdog Alert\n",
-            f"Portfolio: ${total_value:>,.2f} ({total_pnl_pct:>+.1f}%)\n",
-        ]
-
-        critical = [a for a in all_alerts if "CRITICAL" in a[0]]
-        warnings = [a for a in all_alerts if "WARNING" in a[0]]
-        infos = [a for a in all_alerts if "INFO" in a[0]]
-
-        for a in critical + warnings + infos:
-            lines.append(f"{a[0]} [{a[1]}] {a[2]}")
-
-        if critical:
-            lines.append(f"\n{len(critical)} CRITICAL alert(s) - ACTION REQUIRED!")
-
-        await context.bot.send_message(
-            chat_id=TELEGRAM_USER_ID,
-            text="\n".join(lines),
+        text = _build_watchdog_message(
+            portfolio, all_alerts, pos_by_ticker,
+            macro_result, total_value, total_pnl, total_pnl_pct, cash,
         )
+        await context.bot.send_message(chat_id=TELEGRAM_USER_ID, text=text)
 
         # Push political forecast briefing if available
         try:
@@ -450,7 +542,7 @@ async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
                 hour = _dt.datetime.now(tz=pytz.timezone("US/Eastern")).hour
                 label = (
                     "PRE-MARKET BRIEFING" if hour < 10 else
-                    "MIDDAY BRIEFING" if hour < 15 else
+                    "MIDDAY BRIEFING"     if hour < 15 else
                     "AFTER-HOURS BRIEFING"
                 )
                 send_scheduled_briefing(latest, label=label)
