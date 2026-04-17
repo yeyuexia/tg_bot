@@ -86,6 +86,16 @@ def capture_stdout(func, *args, **kwargs):
     return buf.getvalue(), result
 
 
+def _alpaca_sync():
+    """Sync from Alpaca paper and return a PortfolioSnapshot. Raises on error."""
+    from dotenv import load_dotenv
+    load_dotenv()
+    from broker import Broker
+    import config, orders
+    broker = Broker(env=config.ALPACA_ENV)
+    return orders.sync_state(broker, alerts=[])
+
+
 @auth
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show two-tranche portfolio plan: structure, deployment, and per-tranche stats."""
@@ -169,26 +179,45 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Checking portfolio...")
+    await update.message.reply_text("Syncing from Alpaca...")
     try:
-        from watchdog import load_portfolio, check_portfolio_status
-        portfolio = load_portfolio()
-        if not portfolio["positions"]:
-            await update.message.reply_text("No portfolio found.")
-            return
+        import config
+        loop = asyncio.get_event_loop()
+        snap = await loop.run_in_executor(None, _alpaca_sync)
 
-        rows, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
+        initial = config.INITIAL_CAPITAL
+        total_pnl = snap.equity - initial
+        total_pnl_pct = total_pnl / initial * 100
+
         lines = []
-        for r in rows:
-            icon = "+" if r["pnl"] >= 0 else "-"
-            lines.append(
-                f"{icon} {r['ticker']:6s} {r['shares']:3d}x ${r['current']:>8.2f} = ${r['value']:>9.2f} "
-                f"P&L: ${r['pnl']:>+8.2f} ({r['pnl_pct']:>+.1f}%)"
-            )
-        lines.append(f"\nCash:      ${cash:>10,.2f}")
-        lines.append(f"Portfolio: ${total_value:>10,.2f}")
-        icon = "+" if total_pnl >= 0 else "-"
-        lines.append(f"Total P&L: {icon} ${abs(total_pnl):>10,.2f} ({total_pnl_pct:>+.1f}%)")
+        if not snap.positions:
+            lines.append("No open positions — fully in cash.")
+        else:
+            core_pos = [p for p in snap.positions if p.get("tranche") == "core"]
+            agg_pos  = [p for p in snap.positions if p.get("tranche") == "aggressive"]
+
+            def _fmt_pos(positions, label):
+                if not positions:
+                    return
+                lines.append(label)
+                for p in positions:
+                    pl = p["unrealized_pl"]
+                    pl_pct = pl / (p["market_value"] - pl) * 100 if (p["market_value"] - pl) != 0 else 0
+                    icon = "+" if pl >= 0 else "-"
+                    lines.append(
+                        f"  {icon} {p['symbol']:6s}  {p['shares']:.0f}sh"
+                        f"  ${p['market_value']:>9,.2f}"
+                        f"  P&L ${pl:>+8,.2f} ({pl_pct:>+.1f}%)"
+                    )
+
+            _fmt_pos(core_pos,  "── Core ──────────────────────────────")
+            _fmt_pos(agg_pos,   "── Aggressive ────────────────────────")
+
+        lines.append(f"\nCash:      ${snap.cash:>12,.2f}")
+        lines.append(f"Equity:    ${snap.equity:>12,.2f}")
+        pnl_icon = "+" if total_pnl >= 0 else "-"
+        lines.append(f"Total P&L: {pnl_icon} ${abs(total_pnl):>10,.2f} ({total_pnl_pct:>+.1f}%)")
+        lines.append(f"\n[{config.ALPACA_ENV.upper()}]  synced {snap.synced_at[:19]} UTC")
         await send_long_message(update, "\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -196,19 +225,37 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth
 async def cmd_watchdog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Running watchdog...")
+    await update.message.reply_text("Running watchdog (syncing Alpaca)...")
     try:
         from watchdog import (
-            load_portfolio, check_price_moves, check_volume,
+            check_price_moves, check_volume,
             check_macro_shift, check_news, check_rebalance,
-            check_portfolio_status,
         )
+        import config
         loop = asyncio.get_event_loop()
 
         def _run():
-            portfolio = load_portfolio()
+            # Sync live positions from Alpaca first
+            snap = _alpaca_sync()
+
+            # Translate snapshot to the portfolio dict shape watchdog checks expect
+            portfolio = {
+                "positions": [
+                    {
+                        "ticker": p["symbol"],
+                        "shares": p["shares"],
+                        "entry_price": p["avg_entry"],
+                        "tranche": p.get("tranche", "core"),
+                    }
+                    for p in snap.positions
+                ],
+                "cash": snap.cash,
+                "initial_capital": config.INITIAL_CAPITAL,
+            }
+
             if not portfolio["positions"]:
-                return None, None, None, None, None, None, None
+                return None, None, None, None, None, None, None, None
+
             all_alerts = []
             all_alerts.extend(check_price_moves(portfolio))
             all_alerts.extend(check_volume(portfolio))
@@ -216,15 +263,32 @@ async def cmd_watchdog(update: Update, context: ContextTypes.DEFAULT_TYPE):
             all_alerts.extend(macro_alerts)
             all_alerts.extend(check_news(portfolio))
             all_alerts.extend(check_rebalance(portfolio))
-            rows, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
-            pos_by_ticker = {r["ticker"]: r for r in rows}
+
+            # Build pos_by_ticker from Alpaca's already-computed values
+            pos_by_ticker = {
+                p["symbol"]: {
+                    "ticker": p["symbol"],
+                    "shares": p["shares"],
+                    "current": p["market_value"] / p["shares"] if p["shares"] else 0,
+                    "value": p["market_value"],
+                    "pnl": p["unrealized_pl"],
+                    "pnl_pct": p["unrealized_pl"] / (p["market_value"] - p["unrealized_pl"]) * 100
+                               if (p["market_value"] - p["unrealized_pl"]) else 0,
+                    "entry_price": p["avg_entry"],
+                }
+                for p in snap.positions
+            }
+            total_value  = snap.equity
+            total_pnl    = snap.equity - config.INITIAL_CAPITAL
+            total_pnl_pct = total_pnl / config.INITIAL_CAPITAL * 100
+            cash         = snap.cash
             return portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash
 
-        _, result = await loop.run_in_executor(None, capture_stdout, _run)
+        result = await loop.run_in_executor(None, _run)
         portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash = result
 
         if portfolio is None:
-            await update.message.reply_text("No portfolio found.")
+            await update.message.reply_text("No open positions yet.")
             return
         if not all_alerts:
             await update.message.reply_text("All clear. No actionable alerts.")
@@ -626,15 +690,29 @@ def _build_watchdog_message(portfolio, all_alerts, pos_by_ticker,
 async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
     """Run watchdog and send alerts to the user. Called by JobQueue on schedule."""
     try:
+        import config
         from watchdog import (
-            load_portfolio, check_price_moves, check_volume,
+            check_price_moves, check_volume,
             check_macro_shift, check_news, check_rebalance,
-            check_portfolio_status,
         )
 
-        portfolio = load_portfolio()
+        # Always sync from Alpaca so positions and P&L are accurate
+        snap = _alpaca_sync()
+        portfolio = {
+            "positions": [
+                {
+                    "ticker": p["symbol"],
+                    "shares": p["shares"],
+                    "entry_price": p["avg_entry"],
+                    "tranche": p.get("tranche", "core"),
+                }
+                for p in snap.positions
+            ],
+            "cash": snap.cash,
+            "initial_capital": config.INITIAL_CAPITAL,
+        }
         if not portfolio["positions"]:
-            return  # no portfolio, nothing to alert on
+            return  # no positions yet, nothing to alert on
 
         all_alerts = []
         all_alerts.extend(check_price_moves(portfolio))
@@ -646,10 +724,25 @@ async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
         all_alerts.extend(check_rebalance(portfolio))
 
         if not all_alerts:
-            return  # no alerts, stay silent
+            return  # all clear, stay silent
 
-        rows, total_value, total_pnl, total_pnl_pct, cash = check_portfolio_status(portfolio)
-        pos_by_ticker = {r["ticker"]: r for r in rows}
+        pos_by_ticker = {
+            p["symbol"]: {
+                "ticker": p["symbol"],
+                "shares": p["shares"],
+                "current": p["market_value"] / p["shares"] if p["shares"] else 0,
+                "value": p["market_value"],
+                "pnl": p["unrealized_pl"],
+                "pnl_pct": p["unrealized_pl"] / (p["market_value"] - p["unrealized_pl"]) * 100
+                           if (p["market_value"] - p["unrealized_pl"]) else 0,
+                "entry_price": p["avg_entry"],
+            }
+            for p in snap.positions
+        }
+        total_value   = snap.equity
+        total_pnl     = snap.equity - config.INITIAL_CAPITAL
+        total_pnl_pct = total_pnl / config.INITIAL_CAPITAL * 100
+        cash          = snap.cash
 
         text = _build_watchdog_message(
             portfolio, all_alerts, pos_by_ticker,
