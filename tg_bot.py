@@ -13,7 +13,8 @@ import io
 import json
 import asyncio
 import logging
-from datetime import time as dt_time
+from datetime import date, time as dt_time
+from pathlib import Path
 from functools import wraps
 from contextlib import redirect_stdout
 
@@ -38,6 +39,109 @@ WORK_DIR = os.path.join(os.path.dirname(__file__), "..")
 
 # Track Claude session per Telegram user for conversation continuity
 _claude_sessions = {}  # user_id -> session_id
+
+MEMORY_DIR = Path(os.path.dirname(__file__)) / "memory"
+MEMORY_DIR.mkdir(exist_ok=True)
+
+
+def load_recent_memory(max_days: int = 3) -> str:
+    """Load the most recent memory files as baseline context."""
+    files = sorted(MEMORY_DIR.glob("*.md"), reverse=True)[:max_days]
+    if not files:
+        return ""
+    parts = []
+    for f in reversed(files):  # chronological order
+        parts.append(f"## {f.stem}\n{f.read_text().strip()}")
+    return "\n\n".join(parts)
+
+
+async def search_memory(query: str) -> str:
+    """Use qmd to search memory for relevant past context."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "qmd", "query", query, "-n", "5", "-c", "tg-bot-memory",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        result = stdout.decode().strip()
+        if not result or "No results" in result:
+            return ""
+        return result
+    except Exception as e:
+        logger.warning("qmd search failed: %s", e)
+        return ""
+
+
+async def load_memory(user_msg: str) -> str:
+    """Build memory context: recent days + qmd search results for the query."""
+    recent = load_recent_memory()
+    searched = await search_memory(user_msg)
+
+    parts = []
+    if recent:
+        parts.append(f"# Recent Memory\n{recent}")
+    if searched:
+        parts.append(f"# Relevant Past Context\n{searched}")
+    return "\n\n".join(parts)
+
+
+async def update_qmd_index():
+    """Re-index the memory collection in qmd."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "qmd", "update",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+        # Rebuild embeddings for vector search
+        proc = await asyncio.create_subprocess_exec(
+            "qmd", "embed",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=60)
+    except Exception as e:
+        logger.warning("qmd index update failed: %s", e)
+
+
+async def save_memory(user_msg: str, assistant_response: str):
+    """Ask Claude to extract memorable facts from the conversation, append to today's file."""
+    today = date.today().isoformat()
+    prompt = (
+        "Below is a conversation exchange between a user and an assistant. "
+        "Extract ONLY facts worth remembering for future conversations — "
+        "decisions made, preferences expressed, tasks completed, issues found, "
+        "or important context. "
+        "If nothing is worth remembering, respond with exactly: NOTHING\n"
+        "Otherwise respond with concise bullet points (no headings, no preamble).\n\n"
+        f"User: {user_msg}\n\n"
+        f"Assistant: {assistant_response[:2000]}"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--print", "--max-turns", "1",
+            "--model", "haiku",
+            "-p", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        result = stdout.decode().strip()
+        if not result or "NOTHING" in result.upper():
+            return
+        mem_file = MEMORY_DIR / f"{today}.md"
+        existing = mem_file.read_text().strip() if mem_file.exists() else ""
+        if existing:
+            mem_file.write_text(f"{existing}\n{result}\n")
+        else:
+            mem_file.write_text(f"{result}\n")
+        logger.info("Memory saved to %s", mem_file)
+        # Update qmd index after saving new memory
+        await update_qmd_index()
+    except Exception as e:
+        logger.warning("Memory save failed: %s", e)
 
 # Add stock dir to path so we can import its modules
 sys.path.insert(0, os.path.abspath(STOCK_DIR))
@@ -536,6 +640,14 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_msg:
         return
 
+    # /continue resumes the last conversation
+    resume = False
+    if user_msg.strip().lower().startswith("/continue"):
+        user_msg = user_msg.strip()[len("/continue"):].strip()
+        resume = True
+        if not user_msg:
+            user_msg = "continue"
+
     # /new resets the conversation
     if user_msg.strip().lower() == "/new":
         _claude_sessions.pop(update.effective_user.id, None)
@@ -546,17 +658,23 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     proc = None
     try:
         user_id = update.effective_user.id
-        session_id = _claude_sessions.get(user_id)
+        session_id = _claude_sessions.get(user_id) if resume else None
+
+        memory = await load_memory(user_msg)
+        system_extra = (
+            "Be efficient: batch multiple independent tool calls in a single turn. "
+            "For example, read multiple files at once, or make multiple edits at once. "
+            "Minimize total turns used."
+        )
+        if memory:
+            system_extra = f"{memory}\n\n{system_extra}"
 
         cmd = ["claude", "--print", "--max-turns", "200",
                "--output-format", "json",
                "--model", "sonnet",
                "--dangerously-skip-permissions",
                "--add-dir", os.path.expanduser("~/works"),
-               "--append-system-prompt",
-               "Be efficient: batch multiple independent tool calls in a single turn. "
-               "For example, read multiple files at once, or make multiple edits at once. "
-               "Minimize total turns used."]
+               "--append-system-prompt", system_extra]
         if session_id:
             cmd += ["--resume", session_id, "-p", user_msg]
         else:
@@ -602,6 +720,8 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = f"(no output)\nstderr: {stderr.decode().strip()}"
         await thinking_msg.delete()
         await send_long_message(update, response)
+        # Save memory in background (don't block the response)
+        asyncio.create_task(save_memory(user_msg, response))
     except asyncio.TimeoutError:
         if proc:
             proc.kill()
