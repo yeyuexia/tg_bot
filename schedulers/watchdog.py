@@ -1,18 +1,78 @@
 import asyncio
 import datetime as _dt
 import logging
+from datetime import time as dt_time
 
 import pytz
 
 from core.alpaca import sync as alpaca_sync
 from core.config import TELEGRAM_USER_ID
 
+et = pytz.timezone("US/Eastern")
+SCHEDULE_TIMES = [
+    dt_time(hour=8,  minute=10, tzinfo=et),
+    dt_time(hour=12, minute=30, tzinfo=et),
+    dt_time(hour=17, minute=0,  tzinfo=et),
+]
+SCHEDULE_DAYS = (0, 1, 2, 3, 4)
+
 logger = logging.getLogger(__name__)
 
 
-def build_watchdog_message(portfolio, all_alerts, pos_by_ticker,
-                            macro_result, total_value, total_pnl, total_pnl_pct, cash):
-    et = pytz.timezone("US/Eastern")
+def _build_portfolio_and_alerts(snap):
+    import config
+    from watchdog import (
+        check_price_moves, check_volume,
+        check_macro_shift, check_news, check_rebalance,
+    )
+
+    portfolio = {
+        "positions": [
+            {
+                "ticker": p["symbol"],
+                "shares": p["shares"],
+                "entry_price": p["avg_entry"],
+                "tranche": p.get("tranche", "core"),
+            }
+            for p in snap.positions
+        ],
+        "cash": snap.cash,
+        "initial_capital": config.INITIAL_CAPITAL,
+    }
+
+    if not portfolio["positions"]:
+        return None
+
+    all_alerts = []
+    all_alerts.extend(check_price_moves(portfolio))
+    all_alerts.extend(check_volume(portfolio))
+    macro_alerts, macro_result = check_macro_shift()
+    all_alerts.extend(macro_alerts)
+    all_alerts.extend(check_news(portfolio))
+    all_alerts.extend(check_rebalance(portfolio))
+
+    pos_by_ticker = {
+        p["symbol"]: {
+            "ticker": p["symbol"],
+            "shares": p["shares"],
+            "current": p["market_value"] / p["shares"] if p["shares"] else 0,
+            "value": p["market_value"],
+            "pnl": p["unrealized_pl"],
+            "pnl_pct": p["unrealized_pl"] / (p["market_value"] - p["unrealized_pl"]) * 100
+                       if (p["market_value"] - p["unrealized_pl"]) else 0,
+            "entry_price": p["avg_entry"],
+        }
+        for p in snap.positions
+    }
+    total_value   = snap.equity
+    total_pnl     = snap.equity - config.INITIAL_CAPITAL
+    total_pnl_pct = total_pnl / config.INITIAL_CAPITAL * 100
+    cash          = snap.cash
+    return portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash
+
+
+def _build_message(portfolio, all_alerts, pos_by_ticker,
+                   macro_result, total_value, total_pnl, total_pnl_pct, cash):
     now_et = _dt.datetime.now(tz=et)
     hour = now_et.hour
     session = (
@@ -77,62 +137,20 @@ def build_watchdog_message(portfolio, all_alerts, pos_by_ticker,
     return "\n".join(lines)
 
 
-async def scheduled_watchdog(context):
+async def scheduled_handler(context):
     try:
-        import config
-        from watchdog import (
-            check_price_moves, check_volume,
-            check_macro_shift, check_news, check_rebalance,
-        )
-
         loop = asyncio.get_event_loop()
         snap = await loop.run_in_executor(None, alpaca_sync)
-        portfolio = {
-            "positions": [
-                {
-                    "ticker": p["symbol"],
-                    "shares": p["shares"],
-                    "entry_price": p["avg_entry"],
-                    "tranche": p.get("tranche", "core"),
-                }
-                for p in snap.positions
-            ],
-            "cash": snap.cash,
-            "initial_capital": config.INITIAL_CAPITAL,
-        }
-        if not portfolio["positions"]:
+        result = await loop.run_in_executor(None, _build_portfolio_and_alerts, snap)
+
+        if result is None:
             return
 
-        all_alerts = []
-        all_alerts.extend(check_price_moves(portfolio))
-        all_alerts.extend(check_volume(portfolio))
-        macro_alerts, macro_result = check_macro_shift()
-        all_alerts.extend(macro_alerts)
-        all_alerts.extend(check_news(portfolio))
-        all_alerts.extend(check_rebalance(portfolio))
-
+        portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash = result
         if not all_alerts:
             return
 
-        pos_by_ticker = {
-            p["symbol"]: {
-                "ticker": p["symbol"],
-                "shares": p["shares"],
-                "current": p["market_value"] / p["shares"] if p["shares"] else 0,
-                "value": p["market_value"],
-                "pnl": p["unrealized_pl"],
-                "pnl_pct": p["unrealized_pl"] / (p["market_value"] - p["unrealized_pl"]) * 100
-                           if (p["market_value"] - p["unrealized_pl"]) else 0,
-                "entry_price": p["avg_entry"],
-            }
-            for p in snap.positions
-        }
-        total_value   = snap.equity
-        total_pnl     = snap.equity - config.INITIAL_CAPITAL
-        total_pnl_pct = total_pnl / config.INITIAL_CAPITAL * 100
-        cash          = snap.cash
-
-        text = build_watchdog_message(
+        text = _build_message(
             portfolio, all_alerts, pos_by_ticker,
             macro_result, total_value, total_pnl, total_pnl_pct, cash,
         )
@@ -144,7 +162,7 @@ async def scheduled_watchdog(context):
             _init_db()
             latest = get_latest_analysis()
             if latest:
-                hour = _dt.datetime.now(tz=pytz.timezone("US/Eastern")).hour
+                hour = _dt.datetime.now(tz=et).hour
                 label = (
                     "PRE-MARKET BRIEFING" if hour < 10 else
                     "MIDDAY BRIEFING"     if hour < 15 else
