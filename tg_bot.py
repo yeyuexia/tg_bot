@@ -11,12 +11,16 @@ import os
 import sys
 import io
 import json
+import base64
 import asyncio
 import logging
 from datetime import date, time as dt_time
 from pathlib import Path
+from collections import deque
 from functools import wraps
 from contextlib import redirect_stdout
+
+import anthropic
 
 import pytz
 
@@ -30,7 +34,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-load_dotenv()
+load_dotenv()  # tg-bot/.env (Telegram tokens)
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "stock", ".env"))  # stock/.env (Alpaca keys)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
@@ -39,6 +44,12 @@ WORK_DIR = os.path.join(os.path.dirname(__file__), "..")
 
 # Track Claude session per Telegram user for conversation continuity
 _claude_sessions = {}  # user_id -> session_id
+
+# Recent conversation history per user: list of {"user": ..., "assistant": ...}
+_chat_history = {}  # user_id -> deque(maxlen=3)
+
+# Map message_id -> assistant response text for reply context
+_msg_responses = {}  # message_id -> str
 
 MEMORY_DIR = Path(os.path.dirname(__file__)) / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
@@ -163,23 +174,26 @@ def auth(func):
     return wrapper
 
 
-async def send_long_message(update: Update, text: str):
-    """Send a message, splitting into chunks if it exceeds Telegram's 4096 char limit."""
+async def send_long_message(update: Update, text: str) -> list:
+    """Send a message, splitting into chunks if it exceeds Telegram's 4096 char limit.
+    Returns list of sent Message objects."""
+    sent = []
     max_len = 4000  # leave some margin
     if len(text) <= max_len:
-        await update.message.reply_text(text)
-        return
+        sent.append(await update.message.reply_text(text))
+        return sent
     # Split on newlines to avoid breaking mid-line
     lines = text.split("\n")
     chunk = ""
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
-            await update.message.reply_text(chunk)
+            sent.append(await update.message.reply_text(chunk))
             chunk = line + "\n"
         else:
             chunk += line + "\n"
     if chunk.strip():
-        await update.message.reply_text(chunk)
+        sent.append(await update.message.reply_text(chunk))
+    return sent
 
 
 def capture_stdout(func, *args, **kwargs):
@@ -297,25 +311,31 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not snap.positions:
             lines.append("No open positions — fully in cash.")
         else:
-            core_pos = [p for p in snap.positions if p.get("tranche") == "core"]
-            agg_pos  = [p for p in snap.positions if p.get("tranche") == "aggressive"]
+            by_tranche = {}
+            for p in snap.positions:
+                t = p.get("tranche", "unknown")
+                by_tranche.setdefault(t, []).append(p)
 
-            def _fmt_pos(positions, label):
-                if not positions:
-                    return
+            for tranche, positions in by_tranche.items():
+                label = {
+                    "core": "── Core ──────────────────────────────",
+                    "aggressive": "── Aggressive ────────────────────────",
+                }.get(tranche, f"── {tranche.title()} ─────────────────────────────")
                 lines.append(label)
                 for p in positions:
                     pl = p["unrealized_pl"]
-                    pl_pct = pl / (p["market_value"] - pl) * 100 if (p["market_value"] - pl) != 0 else 0
+                    cost = p["market_value"] - pl
+                    pl_pct = pl / cost * 100 if cost != 0 else 0
+                    cur_price = p["market_value"] / p["shares"] if p["shares"] else 0
                     icon = "+" if pl >= 0 else "-"
                     lines.append(
                         f"  {icon} {p['symbol']:6s}  {p['shares']:.0f}sh"
-                        f"  ${p['market_value']:>9,.2f}"
+                        f"  avg ${p['avg_entry']:.2f} → ${cur_price:.2f}"
+                    )
+                    lines.append(
+                        f"           val ${p['market_value']:>9,.2f}"
                         f"  P&L ${pl:>+8,.2f} ({pl_pct:>+.1f}%)"
                     )
-
-            _fmt_pos(core_pos,  "── Core ──────────────────────────────")
-            _fmt_pos(agg_pos,   "── Aggressive ────────────────────────")
 
         lines.append(f"\nCash:      ${snap.cash:>12,.2f}")
         lines.append(f"Equity:    ${snap.equity:>12,.2f}")
@@ -633,6 +653,91 @@ async def cmd_hotspots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
+async def _describe_image(bot, file_id: str, caption: str = "") -> str:
+    """Download a Telegram photo and return a brief Claude description."""
+    photo_file = await bot.get_file(file_id)
+    img_bytes = await photo_file.download_as_bytearray()
+    img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode()
+    prompt = caption or "Describe this image concisely in 1-3 sentences."
+
+    client = anthropic.Anthropic()
+    loop = asyncio.get_event_loop()
+
+    def _call():
+        return client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+
+    result = await loop.run_in_executor(None, _call)
+    return result.content[0].text.strip()
+
+
+@auth
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages by passing them to Claude with vision."""
+    photo = update.message.photo[-1]  # highest resolution available
+    caption = update.message.caption or "What do you see in this image?"
+
+    thinking_msg = await update.message.reply_text("Processing image...")
+    try:
+        photo_file = await context.bot.get_file(photo.file_id)
+        img_bytes = await photo_file.download_as_bytearray()
+        img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode()
+
+        client = anthropic.Anthropic()
+        loop = asyncio.get_event_loop()
+
+        def _call():
+            return client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": img_b64,
+                            },
+                        },
+                        {"type": "text", "text": caption},
+                    ],
+                }],
+            )
+
+        result = await loop.run_in_executor(None, _call)
+        response = result.content[0].text
+
+        user_id = update.effective_user.id
+        await thinking_msg.delete()
+        sent_msgs = await send_long_message(update, response)
+
+        for msg in sent_msgs:
+            _msg_responses[msg.message_id] = response
+        if len(_msg_responses) > 200:
+            oldest_keys = sorted(_msg_responses)[:len(_msg_responses) - 200]
+            for k in oldest_keys:
+                del _msg_responses[k]
+
+        if user_id not in _chat_history:
+            _chat_history[user_id] = deque(maxlen=3)
+        _chat_history[user_id].append({"user": f"[image] {caption}", "assistant": response[:1000]})
+
+        asyncio.create_task(save_memory(f"[image] {caption}", response))
+    except Exception as e:
+        await thinking_msg.edit_text(f"Error processing image: {e}")
+
+
 @auth
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward natural language messages to Claude Code CLI."""
@@ -660,6 +765,51 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         session_id = _claude_sessions.get(user_id) if resume else None
 
+        # Build context from reply-to message and recent history
+        context_parts = []
+
+        # Walk the reply chain to build threaded context
+        reply_chain = []
+        msg = update.message.reply_to_message
+        while msg and len(reply_chain) < 5:  # max 5 levels deep
+            if msg.message_id in _msg_responses:
+                reply_chain.append(f"Assistant: {_msg_responses[msg.message_id][:800]}")
+            elif msg.photo:
+                caption = msg.caption or ""
+                try:
+                    desc = await _describe_image(context.bot, msg.photo[-1].file_id, caption)
+                    role = "Assistant" if msg.from_user and msg.from_user.is_bot else "User"
+                    reply_chain.append(f"{role}: [Image: {desc}]")
+                except Exception:
+                    reply_chain.append(f"User: [Image: unable to describe]")
+            elif msg.text:
+                role = "Assistant" if msg.from_user and msg.from_user.is_bot else "User"
+                reply_chain.append(f"{role}: {msg.text[:800]}")
+            msg = msg.reply_to_message
+
+        if reply_chain:
+            reply_chain.reverse()  # oldest first
+            context_parts.append(
+                "[Reply thread context]\n" + "\n".join(reply_chain)
+            )
+
+        # Include recent conversation history
+        history = _chat_history.get(user_id, [])
+        if history:
+            conv_lines = []
+            for h in history:
+                conv_lines.append(f"User: {h['user'][:300]}")
+                conv_lines.append(f"Assistant: {h['assistant'][:500]}")
+            context_parts.append(
+                "[Recent conversation history]\n" + "\n".join(conv_lines)
+            )
+
+        # Build the prompt with context
+        if context_parts:
+            full_prompt = "\n\n".join(context_parts) + f"\n\n[Current message]\nUser: {user_msg}"
+        else:
+            full_prompt = user_msg
+
         memory = await load_memory(user_msg)
         system_extra = (
             "Be efficient: batch multiple independent tool calls in a single turn. "
@@ -676,9 +826,9 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                "--add-dir", os.path.expanduser("~/works"),
                "--append-system-prompt", system_extra]
         if session_id:
-            cmd += ["--resume", session_id, "-p", user_msg]
+            cmd += ["--resume", session_id, "-p", full_prompt]
         else:
-            cmd += ["-p", user_msg]
+            cmd += ["-p", full_prompt]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -719,7 +869,22 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not response:
             response = f"(no output)\nstderr: {stderr.decode().strip()}"
         await thinking_msg.delete()
-        await send_long_message(update, response)
+        sent_msgs = await send_long_message(update, response)
+
+        # Track sent message IDs for reply-to context
+        for msg in sent_msgs:
+            _msg_responses[msg.message_id] = response
+        # Keep only last 200 entries to avoid unbounded growth
+        if len(_msg_responses) > 200:
+            oldest_keys = sorted(_msg_responses)[:len(_msg_responses) - 200]
+            for k in oldest_keys:
+                del _msg_responses[k]
+
+        # Save to conversation history
+        if user_id not in _chat_history:
+            _chat_history[user_id] = deque(maxlen=3)
+        _chat_history[user_id].append({"user": user_msg, "assistant": response[:1000]})
+
         # Save memory in background (don't block the response)
         asyncio.create_task(save_memory(user_msg, response))
     except asyncio.TimeoutError:
@@ -773,7 +938,7 @@ def _build_watchdog_message(portfolio, all_alerts, pos_by_ticker,
             # Add position context for stock/ETF tickers
             if pos:
                 lines.append(
-                    f"  Entry ${pos['entry']:.2f} | Now ${pos['current']:.2f} | "
+                    f"  Entry ${pos['entry_price']:.2f} | Now ${pos['current']:.2f} | "
                     f"P&L {pos['pnl_pct']:+.1f}% (${pos['pnl']:+,.2f})"
                 )
             # Add action guidance for critical price/stop alerts
@@ -817,7 +982,8 @@ async def scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Always sync from Alpaca so positions and P&L are accurate
-        snap = _alpaca_sync()
+        loop = asyncio.get_event_loop()
+        snap = await loop.run_in_executor(None, _alpaca_sync)
         portfolio = {
             "positions": [
                 {
@@ -938,6 +1104,7 @@ def main():
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
     app.add_handler(CommandHandler("forecast", cmd_forecast))
     app.add_handler(CommandHandler("hotspots", cmd_hotspots))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
     et = pytz.timezone("US/Eastern")
     schedule_times = [
