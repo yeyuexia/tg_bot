@@ -84,3 +84,37 @@ def _cwd(pid: int) -> str:
         if line.startswith("n"):
             return line[1:]
     return "?"
+
+
+from pathlib import Path
+
+
+def _shorten_home(path: str) -> str:
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+
+def _format(ip: str, entries: list[tuple[int, str, int, str]]) -> str:
+    """Render the user-facing message.
+
+    entries: [(pid, command, port, cwd)] — already de-duped.
+    Sorted ascending by port. Cwd shortened with `~` if under $HOME.
+    """
+    if not entries:
+        return "No services listening."
+
+    header = f"Services on {ip}:"
+    if ip == "127.0.0.1":
+        header += " (no LAN interface detected)"
+
+    lines = [header, ""]
+    for pid, cmd, port, cwd in sorted(entries, key=lambda e: e[2]):
+        lines.append(f" {port:<5} {cmd:<15} pid {pid}")
+        lines.append(f"       http://{ip}:{port}")
+        lines.append(f"       {_shorten_home(cwd)}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
