@@ -59,6 +59,10 @@ def _scan() -> list[tuple[int, str, int, str]]:
     return results
 
 
+def _truncate(s: str, n: int = 15) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def _shorten_home(path: str) -> str:
     home = str(Path.home())
     if path == home:
@@ -83,7 +87,7 @@ def _format(ip: str, entries: list[tuple[int, str, int, str]]) -> str:
 
     lines = [header, ""]
     for pid, name, port, cwd in sorted(entries, key=lambda e: e[2]):
-        lines.append(f" {port:<5} {name:<15} pid {pid}")
+        lines.append(f" {port:<5} {_truncate(name):<15} pid {pid}")
         lines.append(f"       http://{ip}:{port}")
         lines.append(f"       {_shorten_home(cwd)}")
         lines.append("")
