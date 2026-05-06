@@ -118,3 +118,33 @@ def _format(ip: str, entries: list[tuple[int, str, int, str]]) -> str:
         lines.append(f"       {_shorten_home(cwd)}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+import asyncio
+
+from core.auth import auth
+from core.utils import send_long_message
+
+COMMAND = "services"
+DESCRIPTION = "List local services running on this machine"
+
+
+@auth
+async def handler(update, context):
+    loop = asyncio.get_event_loop()
+    try:
+        ip, raw = await asyncio.gather(
+            loop.run_in_executor(None, _lan_ip),
+            loop.run_in_executor(None, _listeners),
+        )
+        unique_pids = sorted({pid for pid, _, _ in raw})
+        cwds = await asyncio.gather(*[
+            loop.run_in_executor(None, _cwd, pid) for pid in unique_pids
+        ])
+        cwd_by_pid = dict(zip(unique_pids, cwds))
+        entries = [(pid, cmd, port, cwd_by_pid[pid]) for pid, cmd, port in raw]
+        await send_long_message(update, _format(ip, entries))
+    except FileNotFoundError:
+        await update.message.reply_text("lsof not found — install via Xcode CLT or brew")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
