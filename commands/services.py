@@ -74,7 +74,7 @@ def _cwd(pid: int) -> str:
     """Return the working directory of `pid`, or '?' if it can't be determined."""
     try:
         out = subprocess.check_output(
-            ["lsof", "-p", str(pid), "-d", "cwd", "-Fn"],
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
             text=True,
             stderr=subprocess.DEVNULL,
         )
