@@ -68,3 +68,19 @@ def _listeners() -> list[tuple[int, str, int]]:
             seen.add(key)
             results.append((pid, cmd, port))
     return results
+
+
+def _cwd(pid: int) -> str:
+    """Return the working directory of `pid`, or '?' if it can't be determined."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-p", str(pid), "-d", "cwd", "-Fn"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return "?"
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return "?"
