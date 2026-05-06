@@ -1,4 +1,11 @@
+import asyncio
+import os
 import socket
+import subprocess
+from pathlib import Path
+
+from core.auth import auth
+from core.utils import send_long_message
 
 
 def _lan_ip() -> str:
@@ -15,10 +22,6 @@ def _lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
-
-
-import os
-import subprocess
 
 
 def _listeners() -> list[tuple[int, str, int]]:
@@ -86,9 +89,6 @@ def _cwd(pid: int) -> str:
     return "?"
 
 
-from pathlib import Path
-
-
 def _shorten_home(path: str) -> str:
     home = str(Path.home())
     if path == home:
@@ -120,18 +120,13 @@ def _format(ip: str, entries: list[tuple[int, str, int, str]]) -> str:
     return "\n".join(lines).rstrip()
 
 
-import asyncio
-
-from core.auth import auth
-from core.utils import send_long_message
-
 COMMAND = "services"
 DESCRIPTION = "List local services running on this machine"
 
 
 @auth
 async def handler(update, context):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         ip, raw = await asyncio.gather(
             loop.run_in_executor(None, _lan_ip),
