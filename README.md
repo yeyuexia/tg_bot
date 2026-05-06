@@ -32,6 +32,7 @@ python3 bot.py
 | `/watchdog` | Run daily watchdog check |
 | `/run` | Run full investment system |
 | `/screen` | Value + quality stock screener |
+| `/services` | List local services running on this machine |
 | `/macro` | Macro regime analysis |
 | `/sentiment` | News & social sentiment |
 | `/rebalance` | Rebalance portfolio |
