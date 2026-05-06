@@ -75,10 +75,10 @@ Ports < 1024 are filtered in Python after parsing.
 **2. Cwd per process** — one `lsof` call per unique pid:
 
 ```
-lsof -p <pid> -d cwd -Fn
+lsof -a -p <pid> -d cwd -Fn
 ```
 
-Parse out the `n<path>` line. If the call fails (process exited between calls), use `?` as the cwd.
+The `-a` flag is critical: by default `lsof` ORs its selectors, so `-p PID -d cwd` would dump cwd info for every process. `-a` makes the selectors AND-ed. Parse out the `n<path>` line. If the call fails (process exited between calls), use `?` as the cwd.
 
 **3. LAN IP** — UDP-socket trick:
 
