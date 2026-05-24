@@ -6,13 +6,12 @@ Telegram bot for the quantitative investment system. Provides slash commands for
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) on Telegram
 2. Get your user ID from [@userinfobot](https://t.me/userinfobot)
-3. Copy `.env.example` to `.env` and fill in your values:
+3. Copy `.env.example` to `.env` and fill in your Telegram values:
    ```
    TELEGRAM_BOT_TOKEN=your-bot-token
    TELEGRAM_USER_ID=your-numeric-id
-   ALPACA_API_KEY=your-alpaca-key
-   ALPACA_API_SECRET=your-alpaca-secret
    ```
+   Alpaca credentials are read from the sibling `../stock/.env` (loaded automatically by `core/config.py`), so put `ALPACA_API_KEY` / `ALPACA_API_SECRET` there.
 4. Install dependencies:
    ```bash
    pip install -r requirements.txt
@@ -104,7 +103,7 @@ No changes to `bot.py` needed — commands are auto-discovered on startup.
 
 ### Adding a Scheduled Job
 
-Add these to your command plugin:
+Create `schedulers/myjob.py` with:
 
 ```python
 from datetime import time as dt_time
@@ -114,12 +113,37 @@ et = pytz.timezone("US/Eastern")
 SCHEDULE_TIMES = [dt_time(hour=9, minute=0, tzinfo=et)]
 SCHEDULE_DAYS = (0, 1, 2, 3, 4)  # Mon–Fri
 
-async def scheduled_handler(bot):
-    ...
+async def scheduled_handler(context):
+    await context.bot.send_message(chat_id=..., text="...")
 ```
 
-`bot.py` will register the job automatically.
+`bot.py` will register the job automatically on startup.
 
 ## Auth
 
 Only the configured `TELEGRAM_USER_ID` can interact with the bot. All other messages are silently ignored.
+
+## Running as a service (macOS / launchd)
+
+The bot runs in production under launchd, configured at `~/Library/LaunchAgents/com.zl.tg-bot.plist`:
+
+- `KeepAlive=true` — launchd restarts the bot automatically if it crashes or is killed
+- `RunAtLoad=true` — starts on login
+- `StandardOutPath` / `StandardErrorPath` are set to `/dev/null` so Python's `TimedRotatingFileHandler` is the sole writer to `bot.log` (otherwise launchd would double-write and bypass rotation)
+
+Common operations:
+
+```bash
+# Apply plist changes (also restarts the bot)
+launchctl unload ~/Library/LaunchAgents/com.zl.tg-bot.plist
+launchctl load   ~/Library/LaunchAgents/com.zl.tg-bot.plist
+
+# Restart after a code change
+launchctl kickstart -k gui/$(id -u)/com.zl.tg-bot
+```
+
+## Logging
+
+- All logs go to `bot.log` via a `TimedRotatingFileHandler` (daily rotation at midnight, 7 backups → 1-week retention).
+- Rotated backups are named `bot.log.YYYY-MM-DD`.
+- `httpx` is silenced to `WARNING` because it logs every request at INFO with the full URL — which includes the bot token in the path (`/bot<TOKEN>/getUpdates`).
