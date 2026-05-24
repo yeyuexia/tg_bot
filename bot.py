@@ -8,7 +8,7 @@ Usage:
   2. python3 bot.py
 """
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from telegram import Update
@@ -21,7 +21,7 @@ from schedulers import discover as discover_schedulers
 
 _LOG_PATH = Path(__file__).parent / "bot.log"
 _log_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-_file_handler = RotatingFileHandler(_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5)
+_file_handler = TimedRotatingFileHandler(_LOG_PATH, when="midnight", backupCount=7)
 _file_handler.setFormatter(_log_formatter)
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(_log_formatter)
