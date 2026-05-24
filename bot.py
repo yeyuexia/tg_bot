@@ -26,6 +26,9 @@ _file_handler.setFormatter(_log_formatter)
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(_log_formatter)
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
+# httpx logs every request at INFO with the full URL, which includes the bot
+# token (e.g. /bot<TOKEN>/getUpdates). Silence to WARNING to avoid leaking it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
