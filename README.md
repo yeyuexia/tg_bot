@@ -50,20 +50,22 @@ The watchdog runs automatically at **8:10 AM**, **12:30 PM**, and **5:00 PM ET**
 ## Architecture
 
 ```
-bot.py                  ← entry point; auto-discovers and registers commands
+bot.py                  ← entry point; auto-discovers and registers commands + schedulers
 core/
   config.py             ← env loading, paths
   auth.py               ← @auth decorator (whitelist by TELEGRAM_USER_ID)
   utils.py              ← send_long_message, capture_stdout
   memory.py             ← save/load/search conversation memory
   alpaca.py             ← Alpaca broker sync
-  chat.py               ← Claude natural language chat
+  chat.py               ← Claude natural language chat (/new, /continue)
+  investor_agent.py     ← senior-investor review via Claude CLI (used by /screen)
 commands/
   __init__.py           ← plugin auto-discovery (discover())
-  watchdog.py           ← watchdog command + scheduled job (self-contained)
+  watchdog.py           ← /watchdog manual trigger (shares helpers with schedulers/watchdog.py)
   portfolio.py          ← portfolio status
   run.py                ← full system run
-  screen.py             ← stock screener
+  screen.py             ← stock screener + investor agent review
+  services.py           ← list local services listening on TCP ports
   macro.py              ← macro regime
   sentiment.py          ← sentiment analysis
   rebalance.py          ← rebalancing
@@ -72,7 +74,19 @@ commands/
   plan.py               ← investment plan
   help.py               ← help listing
   start.py              ← /start welcome
+schedulers/
+  __init__.py           ← plugin auto-discovery (discover())
+  watchdog.py           ← scheduled watchdog job (8:10 AM / 12:30 PM / 5:00 PM ET, Mon–Fri)
 ```
+
+### Chat session commands
+
+In addition to the slash commands listed above, the chat handler supports:
+
+| Command | Description |
+|---------|-------------|
+| `/new` | Start a fresh Claude session (clear prior conversation) |
+| `/continue [message]` | Resume the last Claude session, optionally with a follow-up |
 
 ### Adding a New Command
 

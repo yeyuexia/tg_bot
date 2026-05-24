@@ -13,7 +13,7 @@ async def handler(update, context):
     await update.message.reply_text("Syncing from Alpaca...")
     try:
         import config
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         snap = await loop.run_in_executor(None, alpaca_sync)
 
         initial = config.INITIAL_CAPITAL

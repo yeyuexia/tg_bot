@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 async def handler(update, context):
     await update.message.reply_text("Running watchdog (syncing Alpaca)...")
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         snap = await loop.run_in_executor(None, alpaca_sync)
         result = await loop.run_in_executor(None, _build_portfolio_and_alerts, snap)
 

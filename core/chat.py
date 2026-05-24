@@ -19,20 +19,26 @@ logger = logging.getLogger(__name__)
 _claude_sessions = {}
 _chat_history = {}
 _msg_responses = {}
+_MSG_RESPONSES_CAP = 200
 
 
-async def _describe_image(bot, file_id: str, caption: str = "") -> str:
-    photo_file = await bot.get_file(file_id)
-    img_bytes = await photo_file.download_as_bytearray()
-    img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode()
-    prompt = caption or "Describe this image concisely in 1-3 sentences."
+def _record_response(sent_msgs, response: str) -> None:
+    for msg in sent_msgs:
+        _msg_responses[msg.message_id] = response
+    if len(_msg_responses) > _MSG_RESPONSES_CAP:
+        oldest_keys = sorted(_msg_responses)[:len(_msg_responses) - _MSG_RESPONSES_CAP]
+        for k in oldest_keys:
+            del _msg_responses[k]
+
+
+async def _call_claude_vision(img_b64: str, prompt: str, model: str, max_tokens: int) -> str:
     client = anthropic.Anthropic()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _call():
         return client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=256,
+            model=model,
+            max_tokens=max_tokens,
             messages=[{
                 "role": "user",
                 "content": [
@@ -43,7 +49,16 @@ async def _describe_image(bot, file_id: str, caption: str = "") -> str:
         )
 
     result = await loop.run_in_executor(None, _call)
-    return result.content[0].text.strip()
+    return result.content[0].text
+
+
+async def _describe_image(bot, file_id: str, caption: str = "") -> str:
+    photo_file = await bot.get_file(file_id)
+    img_bytes = await photo_file.download_as_bytearray()
+    img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode()
+    prompt = caption or "Describe this image concisely in 1-3 sentences."
+    text = await _call_claude_vision(img_b64, prompt, "claude-haiku-4-5-20251001", 256)
+    return text.strip()
 
 
 @auth
@@ -55,34 +70,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await context.bot.get_file(photo.file_id)
         img_bytes = await photo_file.download_as_bytearray()
         img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode()
-        client = anthropic.Anthropic()
-        loop = asyncio.get_event_loop()
-
-        def _call():
-            return client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                        {"type": "text", "text": caption},
-                    ],
-                }],
-            )
-
-        result = await loop.run_in_executor(None, _call)
-        response = result.content[0].text
+        response = await _call_claude_vision(img_b64, caption, "claude-sonnet-4-6", 4096)
         user_id = update.effective_user.id
         await thinking_msg.delete()
         sent_msgs = await send_long_message(update, response)
-
-        for msg in sent_msgs:
-            _msg_responses[msg.message_id] = response
-        if len(_msg_responses) > 200:
-            oldest_keys = sorted(_msg_responses)[:len(_msg_responses) - 200]
-            for k in oldest_keys:
-                del _msg_responses[k]
+        _record_response(sent_msgs, response)
 
         if user_id not in _chat_history:
             _chat_history[user_id] = deque(maxlen=3)
@@ -92,24 +84,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await thinking_msg.edit_text(f"Error processing image: {e}")
 
 
-@auth
-async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_msg = update.message.text
-    if not user_msg:
-        return
-
-    resume = False
-    if user_msg.strip().lower().startswith("/continue"):
-        user_msg = user_msg.strip()[len("/continue"):].strip()
-        resume = True
-        if not user_msg:
-            user_msg = "continue"
-
-    if user_msg.strip().lower() == "/new":
-        _claude_sessions.pop(update.effective_user.id, None)
-        await update.message.reply_text("Started a new conversation.")
-        return
-
+async def _run_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_msg: str, resume: bool):
     thinking_msg = await update.message.reply_text("Thinking...")
     proc = None
     try:
@@ -206,16 +181,11 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         if not response:
-            response = f"(no output)\nstderr: {stderr.decode().strip()}"
+            logger.warning("Claude returned no output. stderr: %s", stderr.decode().strip())
+            response = "(no output from Claude)"
         await thinking_msg.delete()
         sent_msgs = await send_long_message(update, response)
-
-        for msg in sent_msgs:
-            _msg_responses[msg.message_id] = response
-        if len(_msg_responses) > 200:
-            oldest_keys = sorted(_msg_responses)[:len(_msg_responses) - 200]
-            for k in oldest_keys:
-                del _msg_responses[k]
+        _record_response(sent_msgs, response)
 
         if user_id not in _chat_history:
             _chat_history[user_id] = deque(maxlen=3)
@@ -230,3 +200,23 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Claude CLI not found. Make sure 'claude' is in PATH.")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
+
+
+@auth
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_msg = update.message.text
+    if not user_msg:
+        return
+    await _run_chat(update, context, user_msg, resume=False)
+
+
+@auth
+async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _claude_sessions.pop(update.effective_user.id, None)
+    await update.message.reply_text("Started a new conversation.")
+
+
+@auth
+async def cmd_continue_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_msg = " ".join(context.args).strip() if context.args else "continue"
+    await _run_chat(update, context, user_msg, resume=True)

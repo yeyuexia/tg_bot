@@ -12,7 +12,7 @@ async def handler(update, context):
     await update.message.reply_text("Fetching sentiment...")
     try:
         from sentiment import get_market_hotspots
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         _, hotspots = await loop.run_in_executor(None, capture_stdout, get_market_hotspots)
         mood = hotspots["market_mood"]
         label = hotspots["mood_label"]

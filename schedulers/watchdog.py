@@ -139,7 +139,7 @@ def _build_message(portfolio, all_alerts, pos_by_ticker,
 
 async def scheduled_handler(context):
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         snap = await loop.run_in_executor(None, alpaca_sync)
         result = await loop.run_in_executor(None, _build_portfolio_and_alerts, snap)
 

@@ -12,7 +12,7 @@ async def handler(update, context):
     await update.message.reply_text("Running macro analysis...")
     try:
         from macro import macro_regime_score, macro_risk_adjustment
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _run():
             result = macro_regime_score()

@@ -26,7 +26,7 @@ async def handler(update, context):
         from broker import Broker
         import config
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _run():
             broker = Broker(env=config.ALPACA_ENV)
@@ -34,7 +34,7 @@ async def handler(update, context):
             for t in tranches:
                 result = rebalancer.run(tranche=t, dry_run=False, force=True, broker=broker)
                 if result is None:
-                    lines.append(f"{t.upper()}: not due yet (use /rebalance {t} to force)")
+                    lines.append(f"{t.upper()}: no orders generated")
                     continue
                 submitted = len(result.submitted)
                 queued    = len(result.queued)

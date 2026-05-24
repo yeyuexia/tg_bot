@@ -12,7 +12,7 @@ async def handler(update, context):
     await update.message.reply_text("Fetching latest political forecast...")
     try:
         from news_store import init_db, get_latest_analysis
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _run():
             init_db()

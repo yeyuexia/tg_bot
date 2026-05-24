@@ -8,19 +8,24 @@ Usage:
   2. python3 bot.py
 """
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from core.config import TELEGRAM_BOT_TOKEN
-from core.chat import handle_chat, handle_photo
+from core.chat import handle_chat, handle_photo, cmd_new_chat, cmd_continue_chat
 from commands import discover
 from schedulers import discover as discover_schedulers
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+_LOG_PATH = Path(__file__).parent / "bot.log"
+_log_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_file_handler = RotatingFileHandler(_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5)
+_file_handler.setFormatter(_log_formatter)
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_log_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +34,9 @@ def main():
 
     for command, handler_fn, _, _plugin in discover():
         app.add_handler(CommandHandler(command, handler_fn))
+
+    app.add_handler(CommandHandler("new", cmd_new_chat))
+    app.add_handler(CommandHandler("continue", cmd_continue_chat))
 
     for name, scheduled_fn, schedule_times, schedule_days in discover_schedulers():
         for t in schedule_times:

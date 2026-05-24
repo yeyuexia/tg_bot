@@ -13,11 +13,11 @@ async def handler(update, context):
     await update.message.reply_text("Checking recent hotspot alerts...")
     try:
         from news_store import init_db, _get_conn
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _run():
             init_db()
-            cutoff = (dt.datetime.utcnow() - dt.timedelta(hours=24)).isoformat()
+            cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)).isoformat()
             with _get_conn() as conn:
                 rows = conn.execute(
                     "SELECT * FROM llm_analyses WHERE trigger='hotspot' AND created_at > ? "
