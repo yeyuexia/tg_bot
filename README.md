@@ -123,6 +123,23 @@ async def scheduled_handler(context):
 
 Only the configured `TELEGRAM_USER_ID` can interact with the bot. All other messages are silently ignored.
 
+## Memory
+
+Each chat exchange is summarized by Claude Haiku and appended to `memory/YYYY-MM-DD.md`. Before the next message, the bot prepends two blocks to the system prompt: the raw last 3 days of memory, plus the top-5 semantic-search hits across the full history.
+
+The semantic-search half uses the `qmd` CLI and is **optional** — without it, the bot logs `qmd search failed: ... No such file or directory: 'qmd'` and falls back to raw recency only. To enable it:
+
+1. Install `qmd` and make sure its install dir is on the launchd plist's `PATH`. Example for a Bun install:
+   ```xml
+   <key>PATH</key>
+   <string>/Users/zl/.bun/bin:/Users/zl/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+   ```
+2. Register the memory dir as a collection and build the index:
+   ```bash
+   qmd collection add /Users/zl/works/tg-bot/memory --name tg-bot-memory --mask "**/*.md"
+   qmd update && qmd embed
+   ```
+
 ## Running as a service (macOS / launchd)
 
 The bot runs in production under launchd, configured at `~/Library/LaunchAgents/com.zl.tg-bot.plist`:
