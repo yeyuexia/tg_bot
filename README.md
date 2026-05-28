@@ -57,6 +57,7 @@ core/
   memory.py             ← save/load/search conversation memory
   alpaca.py             ← Alpaca broker sync
   chat.py               ← Claude natural language chat (/new, /continue)
+  session_store.py      ← SQLite persistence for Claude sessions + msg→response cache
 commands/
   __init__.py           ← plugin auto-discovery (discover())
   _screen_investor.py   ← senior-investor review via Claude CLI (private helper for screen.py)

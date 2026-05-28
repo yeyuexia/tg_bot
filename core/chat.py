@@ -10,6 +10,7 @@ import anthropic
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from core import session_store
 from core.auth import auth
 from core.config import WORK_DIR
 from core.memory import load_memory, save_memory
@@ -17,10 +18,10 @@ from core.utils import send_long_message
 
 logger = logging.getLogger(__name__)
 
-_claude_sessions = {}
+# Per-user rolling chat history is kept in memory (short window, not worth
+# persisting). Claude session ids and recent bot responses live in
+# core.session_store so they survive launchd restarts.
 _chat_history = {}
-_msg_responses = {}
-_MSG_RESPONSES_CAP = 200
 
 _CLAUDE_HARD_TIMEOUT_S = 1800
 _PROGRESS_INTERVAL_S = 30
@@ -32,12 +33,7 @@ _SYSTEM_PROMPT_BASE = (
 
 
 def _record_response(sent_msgs, response: str) -> None:
-    for msg in sent_msgs:
-        _msg_responses[msg.message_id] = response
-    if len(_msg_responses) > _MSG_RESPONSES_CAP:
-        oldest_keys = sorted(_msg_responses)[:len(_msg_responses) - _MSG_RESPONSES_CAP]
-        for k in oldest_keys:
-            del _msg_responses[k]
+    session_store.add_response([m.message_id for m in sent_msgs], response)
 
 
 async def _call_claude_vision(img_b64: str, prompt: str, model: str, max_tokens: int) -> str:
@@ -98,8 +94,9 @@ async def _build_reply_chain(message, bot, max_depth: int = 5) -> List[str]:
     chain = []
     msg = message.reply_to_message
     while msg and len(chain) < max_depth:
-        if msg.message_id in _msg_responses:
-            chain.append(f"Assistant: {_msg_responses[msg.message_id][:800]}")
+        cached = session_store.get_response(msg.message_id)
+        if cached is not None:
+            chain.append(f"Assistant: {cached[:800]}")
         elif msg.photo:
             cap = msg.caption or ""
             try:
@@ -221,7 +218,7 @@ async def _run_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_msg
     thinking_msg = await update.message.reply_text("Thinking...")
     try:
         user_id = update.effective_user.id
-        session_id = _claude_sessions.get(user_id) if resume else None
+        session_id = session_store.get_session(user_id) if resume else None
 
         full_prompt, system_extra = await _build_context(update, context, user_msg)
         response, new_session_id, stderr = await _invoke_claude(
@@ -229,7 +226,7 @@ async def _run_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_msg
         )
 
         if new_session_id:
-            _claude_sessions[user_id] = new_session_id
+            session_store.set_session(user_id, new_session_id)
 
         if not response:
             logger.warning("Claude returned no output. stderr: %s", stderr.decode().strip())
@@ -254,7 +251,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth
 async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _claude_sessions.pop(update.effective_user.id, None)
+    session_store.clear_session(update.effective_user.id)
     await update.message.reply_text("Started a new conversation.")
 
 
