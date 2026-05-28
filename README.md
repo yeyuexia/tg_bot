@@ -57,9 +57,9 @@ core/
   memory.py             ← save/load/search conversation memory
   alpaca.py             ← Alpaca broker sync
   chat.py               ← Claude natural language chat (/new, /continue)
-  investor_agent.py     ← senior-investor review via Claude CLI (used by /screen)
 commands/
   __init__.py           ← plugin auto-discovery (discover())
+  _screen_investor.py   ← senior-investor review via Claude CLI (private helper for screen.py)
   watchdog.py           ← /watchdog manual trigger (shares helpers with schedulers/watchdog.py)
   portfolio.py          ← portfolio status
   run.py                ← full system run

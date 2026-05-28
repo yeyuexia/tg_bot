@@ -1,7 +1,7 @@
 import asyncio
 
 from core.auth import auth
-from core.investor_agent import run_investor_review
+from commands._screen_investor import run_investor_review
 from core.utils import capture_stdout, send_long_message
 
 COMMAND = "screen"
