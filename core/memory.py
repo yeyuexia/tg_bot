@@ -3,6 +3,7 @@ import logging
 import time
 from datetime import date
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,14 @@ MEMORY_DIR.mkdir(exist_ok=True)
 _QMD_DEBOUNCE_S = 60.0
 _qmd_lock = asyncio.Lock()
 _last_qmd_update: float = 0.0
+
+# Health counters consumed by commands/status.py. "save" here means a memory
+# file was successfully written (even if the Haiku summarizer returned NOTHING
+# we count the attempt as successful — the summarizer ran, no error occurred).
+last_save: float = 0.0
+last_save_error: Optional[str] = None
+total_saves: int = 0
+total_save_skipped: int = 0  # NOTHING-returns; included for completeness
 
 
 def load_recent_memory(max_days: int = 3) -> str:
@@ -85,6 +94,7 @@ async def update_qmd_index():
 
 
 async def save_memory(user_msg: str, assistant_response: str):
+    global last_save, last_save_error, total_saves, total_save_skipped
     today = date.today().isoformat()
     prompt = (
         "Below is a conversation exchange between a user and an assistant. "
@@ -107,6 +117,7 @@ async def save_memory(user_msg: str, assistant_response: str):
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         result = stdout.decode().strip()
         if not result or "NOTHING" in result.upper():
+            total_save_skipped += 1
             return
         mem_file = MEMORY_DIR / f"{today}.md"
         existing = mem_file.read_text().strip() if mem_file.exists() else ""
@@ -115,6 +126,10 @@ async def save_memory(user_msg: str, assistant_response: str):
         else:
             mem_file.write_text(f"{result}\n")
         logger.info("Memory saved to %s", mem_file)
+        last_save = time.time()
+        last_save_error = None
+        total_saves += 1
         await update_qmd_index()
     except Exception as e:
+        last_save_error = str(e)
         logger.warning("Memory save failed: %s", e)

@@ -1,7 +1,9 @@
 import asyncio
 import datetime as _dt
 import logging
+import time
 from datetime import time as dt_time
+from typing import Optional
 
 import pytz
 
@@ -17,6 +19,11 @@ SCHEDULE_TIMES = [
 SCHEDULE_DAYS = (0, 1, 2, 3, 4)
 
 logger = logging.getLogger(__name__)
+
+# Health counters consumed by commands/status.py.
+last_run: float = 0.0
+last_alert_count: int = 0
+last_error: Optional[str] = None
 
 
 def _build_portfolio_and_alerts(snap):
@@ -138,15 +145,22 @@ def _build_message(portfolio, all_alerts, pos_by_ticker,
 
 
 async def scheduled_handler(context):
+    global last_run, last_alert_count, last_error
     try:
         loop = asyncio.get_running_loop()
         snap = await loop.run_in_executor(None, alpaca_sync)
         result = await loop.run_in_executor(None, _build_portfolio_and_alerts, snap)
 
         if result is None:
+            last_run = time.time()
+            last_alert_count = 0
+            last_error = None
             return
 
         portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash = result
+        last_run = time.time()
+        last_alert_count = len(all_alerts)
+        last_error = None
         if not all_alerts:
             return
 
@@ -172,6 +186,7 @@ async def scheduled_handler(context):
         except Exception as _e:
             logger.error("Forecast push error: %s", _e)
     except Exception as e:
+        last_error = str(e)
         logger.error("Scheduled watchdog error: %s", e)
         await context.bot.send_message(
             chat_id=TELEGRAM_USER_ID,

@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import time
 from collections import deque
 from typing import List, Optional, Tuple
 
@@ -23,6 +24,13 @@ logger = logging.getLogger(__name__)
 # core.session_store so they survive launchd restarts.
 _chat_history = {}
 
+# Health counters consumed by commands/status.py. Updated on every Claude call
+# (text chat or image describe). Reset on process restart, which is fine —
+# /status reports a per-process snapshot, not lifetime totals.
+last_claude_call: float = 0.0       # epoch seconds of last successful call
+last_claude_error: Optional[str] = None  # message from most recent failure
+total_claude_calls: int = 0
+
 _CLAUDE_HARD_TIMEOUT_S = 1800
 _PROGRESS_INTERVAL_S = 30
 _SYSTEM_PROMPT_BASE = (
@@ -34,6 +42,18 @@ _SYSTEM_PROMPT_BASE = (
 
 def _record_response(sent_msgs, response: str) -> None:
     session_store.add_response([m.message_id for m in sent_msgs], response)
+
+
+def _bump_success() -> None:
+    global last_claude_call, last_claude_error, total_claude_calls
+    last_claude_call = time.time()
+    last_claude_error = None
+    total_claude_calls += 1
+
+
+def _bump_failure(err: str) -> None:
+    global last_claude_error
+    last_claude_error = err
 
 
 async def _call_claude_vision(img_b64: str, prompt: str, model: str, max_tokens: int) -> str:
@@ -85,7 +105,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _chat_history[user_id] = deque(maxlen=3)
         _chat_history[user_id].append({"user": f"[image] {caption}", "assistant": response[:1000]})
         asyncio.create_task(save_memory(f"[image] {caption}", response))
+        _bump_success()
     except Exception as e:
+        _bump_failure(str(e))
         await thinking_msg.edit_text(f"Error processing image: {e}")
 
 
@@ -233,11 +255,15 @@ async def _run_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_msg
             response = "(no output from Claude)"
 
         await _finalize(update, response, user_msg, thinking_msg)
+        _bump_success()
     except asyncio.TimeoutError:
+        _bump_failure("timeout after 30 minutes")
         await thinking_msg.edit_text("Claude timed out after 30 minutes.")
     except FileNotFoundError:
+        _bump_failure("claude CLI not found in PATH")
         await update.message.reply_text("Claude CLI not found. Make sure 'claude' is in PATH.")
     except Exception as e:
+        _bump_failure(str(e))
         await update.message.reply_text(f"Error: {e}")
 
 

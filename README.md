@@ -32,6 +32,7 @@ python3 bot.py
 | `/run` | Run full investment system |
 | `/screen` | Value + quality stock screener |
 | `/services` | List local services running on this machine |
+| `/status` | Bot health snapshot (uptime, last call, qmd, log size) |
 | `/macro` | Macro regime analysis |
 | `/sentiment` | News & social sentiment |
 | `/rebalance` | Rebalance portfolio |
@@ -66,6 +67,7 @@ commands/
   run.py                ← full system run
   screen.py             ← stock screener + investor agent review
   services.py           ← list local services listening on TCP ports
+  status.py             ← bot health snapshot (counters + on-disk metadata)
   macro.py              ← macro regime
   sentiment.py          ← sentiment analysis
   rebalance.py          ← rebalancing
