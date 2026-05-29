@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import date
 from pathlib import Path
 
@@ -7,6 +8,13 @@ logger = logging.getLogger(__name__)
 
 MEMORY_DIR = Path(__file__).parent.parent / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
+
+# Debounce qmd update/embed so rapid messages don't pile up redundant runs.
+# Memory entries written during the cooldown window become searchable on the
+# next save after the window expires.
+_QMD_DEBOUNCE_S = 60.0
+_qmd_lock = asyncio.Lock()
+_last_qmd_update: float = 0.0
 
 
 def load_recent_memory(max_days: int = 3) -> str:
@@ -48,21 +56,32 @@ async def load_memory(user_msg: str) -> str:
 
 
 async def update_qmd_index():
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "qmd", "update",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-        proc = await asyncio.create_subprocess_exec(
-            "qmd", "embed",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=60)
-    except Exception as e:
-        logger.warning("qmd index update failed: %s", e)
+    """Run `qmd update` + `qmd embed`, debounced to at most once per 60s and
+    serialized via a module-level lock so concurrent saves never race on the
+    qmd SQLite index."""
+    global _last_qmd_update
+    if time.monotonic() - _last_qmd_update < _QMD_DEBOUNCE_S:
+        return
+    async with _qmd_lock:
+        # Re-check under the lock: a concurrent coroutine may have just run.
+        if time.monotonic() - _last_qmd_update < _QMD_DEBOUNCE_S:
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "qmd", "update",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=30)
+            proc = await asyncio.create_subprocess_exec(
+                "qmd", "embed",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+            _last_qmd_update = time.monotonic()
+        except Exception as e:
+            logger.warning("qmd index update failed: %s", e)
 
 
 async def save_memory(user_msg: str, assistant_response: str):
