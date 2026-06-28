@@ -37,13 +37,22 @@ def load_recent_memory(max_days: int = 3) -> str:
 
 
 async def search_memory(query: str) -> str:
+    """Cheap keyword (BM25) lookup for the chat hot path.
+
+    Uses `qmd search`, NOT `qmd query`. `query` runs embedding + reranking +
+    query-expansion (three local models, ~5-21s cold-start per call) and was
+    adding that latency to *every* message. `search` is pure BM25 over the
+    SQLite index — no models, ~0.1s — and returns the same hits on our small
+    memory corpus. Deeper semantic recall is left to the Claude agent on
+    demand (see _SYSTEM_PROMPT_BASE in core/chat.py).
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
-            "qmd", "query", query, "-n", "5", "-c", "tg-bot-memory",
+            "qmd", "search", query, "-n", "5", "-c", "tg-bot-memory",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         result = stdout.decode().strip()
         if not result or "No results" in result:
             return ""

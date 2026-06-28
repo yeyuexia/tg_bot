@@ -15,6 +15,7 @@ from core import session_store
 from core.auth import auth
 from core.config import WORK_DIR
 from core.memory import load_memory, save_memory
+from core.runner import keep_typing
 from core.utils import send_long_message
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,13 @@ _PROGRESS_INTERVAL_S = 30
 _SYSTEM_PROMPT_BASE = (
     "Be efficient: batch multiple independent tool calls in a single turn. "
     "For example, read multiple files at once, or make multiple edits at once. "
-    "Minimize total turns used."
+    "Minimize total turns used. "
+    "A fast keyword snapshot of your long-term memory may be included above. "
+    "Your full long-term memory is indexed by qmd in the 'tg-bot-memory' "
+    "collection. When a question needs deeper or fuzzier recall than the "
+    "keyword snapshot provides, run "
+    "`qmd query \"<topic>\" -n 5 -c tg-bot-memory` yourself to do a semantic "
+    "search. Only do this when past context is actually relevant."
 )
 
 
@@ -238,6 +245,8 @@ async def _finalize(update: Update, response: str, user_msg: str, thinking_msg) 
 
 async def _run_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_msg: str, resume: bool):
     thinking_msg = await update.message.reply_text("Thinking...")
+    stop = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(update, stop))
     try:
         user_id = update.effective_user.id
         session_id = session_store.get_session(user_id) if resume else None
@@ -265,6 +274,13 @@ async def _run_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_msg
     except Exception as e:
         _bump_failure(str(e))
         await update.message.reply_text(f"Error: {e}")
+    finally:
+        stop.set()
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
 
 @auth

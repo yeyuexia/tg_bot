@@ -4,10 +4,26 @@ import asyncio
 from typing import Any, Callable, Optional, TypeVar
 
 from telegram import Update
+from telegram.constants import ChatAction
 
 from core.utils import capture_stdout, send_long_message
 
 T = TypeVar("T")
+
+_TYPING_INTERVAL_S = 4
+
+
+async def keep_typing(update: Update, stop: asyncio.Event) -> None:
+    """Send ChatAction.TYPING every few seconds until stop is set."""
+    while not stop.is_set():
+        try:
+            await update.message.chat.send_action(ChatAction.TYPING)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(stop.wait()), timeout=_TYPING_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def run_and_send(
@@ -36,6 +52,8 @@ async def run_and_send(
         error_prefix: Prefix for the error reply, e.g. "Rebalance error".
     """
     await update.message.reply_text(status)
+    stop = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(update, stop))
     try:
         loop = asyncio.get_running_loop()
         if capture:
@@ -47,3 +65,10 @@ async def run_and_send(
             await send_long_message(update, text)
     except Exception as e:
         await update.message.reply_text(f"{error_prefix}: {e}")
+    finally:
+        stop.set()
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
