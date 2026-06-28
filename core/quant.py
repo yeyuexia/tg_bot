@@ -91,3 +91,25 @@ def run_investor_review(df):
 def daily_report_argv():
     """argv to run quant's full daily report as a subprocess (run with cwd=STOCK_DIR)."""
     return [sys.executable, "-m", "quant.app.daily_report"]
+
+
+# ── Political-forecast subsystem (quant/news) ────────────────────
+
+def news_latest_analysis():
+    """Latest LLM political analysis dict (or None); ensures the news DB exists."""
+    from quant.news.news_store import init_db, get_latest_analysis
+    init_db()
+    return get_latest_analysis()
+
+
+def news_conn():
+    """Open connection to the news SQLite DB (use as a context manager)."""
+    from quant.news.news_store import init_db, _get_conn
+    init_db()
+    return _get_conn()
+
+
+def send_briefing(analysis, label="BRIEFING"):
+    """Push a scheduled political briefing to Telegram."""
+    from quant.infra.tg_notifier import send_scheduled_briefing
+    return send_scheduled_briefing(analysis, label=label)

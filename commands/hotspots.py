@@ -8,10 +8,9 @@ DESCRIPTION = "Recent severity-3 alerts (24h)"
 
 
 def _work():
-    from news_store import init_db, _get_conn
-    init_db()
+    from core.quant import news_conn
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)).isoformat()
-    with _get_conn() as conn:
+    with news_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM llm_analyses WHERE trigger='hotspot' AND created_at > ? "
             "ORDER BY created_at DESC",

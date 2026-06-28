@@ -161,10 +161,8 @@ async def scheduled_handler(context):
         await context.bot.send_message(chat_id=TELEGRAM_USER_ID, text=text)
 
         try:
-            from news_store import init_db as _init_db, get_latest_analysis
-            from tg_notifier import send_scheduled_briefing
-            _init_db()
-            latest = get_latest_analysis()
+            from core.quant import news_latest_analysis, send_briefing
+            latest = news_latest_analysis()
             if latest:
                 hour = _dt.datetime.now(tz=et).hour
                 label = (
@@ -172,7 +170,7 @@ async def scheduled_handler(context):
                     "MIDDAY BRIEFING"     if hour < 15 else
                     "AFTER-HOURS BRIEFING"
                 )
-                send_scheduled_briefing(latest, label=label)
+                send_briefing(latest, label=label)
         except Exception as _e:
             logger.error("Forecast push error: %s", _e)
     except Exception as e:

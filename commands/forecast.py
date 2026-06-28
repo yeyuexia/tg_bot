@@ -6,9 +6,8 @@ DESCRIPTION = "Latest political briefing"
 
 
 def _work():
-    from news_store import init_db, get_latest_analysis
-    init_db()
-    return get_latest_analysis()
+    from core.quant import news_latest_analysis
+    return news_latest_analysis()
 
 
 def _format(latest):
