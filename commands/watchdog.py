@@ -1,7 +1,7 @@
 import logging
 
-from core.alpaca import sync as alpaca_sync
 from core.auth import auth
+from core.quant import sync_state as alpaca_sync
 from core.runner import run_and_send
 from schedulers.watchdog import _build_portfolio_and_alerts, _build_message
 

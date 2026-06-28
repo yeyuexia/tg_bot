@@ -56,12 +56,11 @@ core/
   auth.py               ← @auth decorator (whitelist by TELEGRAM_USER_ID)
   utils.py              ← send_long_message, capture_stdout
   memory.py             ← save/load/search conversation memory
-  alpaca.py             ← Alpaca broker sync
+  quant.py              ← SINGLE adapter to the ../stock `quant` package (see below)
   chat.py               ← Claude natural language chat (/new, /continue)
   session_store.py      ← SQLite persistence for Claude sessions + msg→response cache
 commands/
   __init__.py           ← plugin auto-discovery (discover())
-  _screen_investor.py   ← senior-investor review via Claude CLI (private helper for screen.py)
   watchdog.py           ← /watchdog manual trigger (shares helpers with schedulers/watchdog.py)
   portfolio.py          ← portfolio status
   run.py                ← full system run
@@ -80,6 +79,21 @@ schedulers/
   __init__.py           ← plugin auto-discovery (discover())
   watchdog.py           ← scheduled watchdog job (8:10 AM / 12:30 PM / 5:00 PM ET, Mon–Fri)
 ```
+
+### Quant integration (decoupled)
+
+The bot is **decoupled** from the quant trading system (`../stock`): `core/quant.py`
+is the **only** module that imports the `quant` package. Every command and scheduler
+calls thin wrappers there (`sync_state`, `load_portfolio`, `check_portfolio_status`,
+`run_alert_checks`, `rebalance`, `screen_stocks`, `run_investor_review`,
+`get_config`, `daily_report_argv`) instead of reaching into quant internals or
+re-implementing its logic. So when the quant side refactors its module layout
+(e.g. the flat-scripts → `quant/` package move), **only `core/quant.py` changes** —
+no command touches `quant.*` directly. Imports inside the adapter are lazy, so the
+heavy quant/data stack only loads when a command actually runs.
+
+(Note: `/forecast` and `/hotspots` couple to a *separate* news-forecast project via
+`news_store`/`tg_notifier`, not to quant — out of scope for this boundary.)
 
 ### Chat session commands
 

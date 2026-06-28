@@ -1,9 +1,7 @@
 import asyncio
-import os
-import sys
 
 from core.auth import auth
-from core.config import STOCK_DIR
+from core.quant import STOCK_DIR, daily_report_argv
 from core.utils import send_long_message
 
 COMMAND = "run"
@@ -15,7 +13,7 @@ async def handler(update, context):
     await update.message.reply_text("Running full investment system... (this takes a minute)")
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, os.path.join(STOCK_DIR, "run.py"),
+            *daily_report_argv(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=STOCK_DIR,

@@ -16,16 +16,11 @@ async def handler(update, context):
     tranches = ["core", "aggressive"] if tranche_arg == "both" else [tranche_arg]
 
     def _work():
-        from dotenv import load_dotenv
-        load_dotenv()
-        import rebalancer
-        from broker import Broker
-        import config
+        from core.quant import rebalance
 
-        broker = Broker(env=config.ALPACA_ENV)
         lines = []
         for t in tranches:
-            result = rebalancer.run(tranche=t, dry_run=False, force=True, broker=broker)
+            result = rebalance(t)
             if result is None:
                 lines.append(f"{t.upper()}: no orders generated")
                 continue

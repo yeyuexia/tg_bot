@@ -6,12 +6,16 @@ DESCRIPTION = "Two-tranche portfolio structure & deployment"
 
 
 def _work():
-    from config import (
-        INITIAL_CAPITAL, AGGRESSIVE_TRANCHE_PCT, AGGRESSIVE_PARAMS,
-        ETF_ALLOCATION_PCT, STOCK_ALLOCATION_PCT,
-        STOP_LOSS_PCT, TRAILING_STOP_PCT, REBALANCE_FREQUENCY_DAYS,
-    )
-    from watchdog import load_portfolio, check_portfolio_status
+    from core.quant import get_config, load_portfolio, check_portfolio_status
+    cfg = get_config()
+    INITIAL_CAPITAL = cfg.INITIAL_CAPITAL
+    AGGRESSIVE_TRANCHE_PCT = cfg.AGGRESSIVE_TRANCHE_PCT
+    AGGRESSIVE_PARAMS = cfg.AGGRESSIVE_PARAMS
+    ETF_ALLOCATION_PCT = cfg.ETF_ALLOCATION_PCT
+    STOCK_ALLOCATION_PCT = cfg.STOCK_ALLOCATION_PCT
+    STOP_LOSS_PCT = cfg.STOP_LOSS_PCT
+    TRAILING_STOP_PCT = cfg.TRAILING_STOP_PCT
+    core_rebal_days = cfg.REBALANCE_DAYS["core"]
 
     core_capital = INITIAL_CAPITAL * (1 - AGGRESSIVE_TRANCHE_PCT)
     agg_capital  = INITIAL_CAPITAL * AGGRESSIVE_TRANCHE_PCT
@@ -39,7 +43,7 @@ def _work():
     lines.append(f"  Deployed: ${core_deployed:,.0f} ({core_util:.0f}%)")
     lines.append(f"  Buckets:  ETF {ETF_ALLOCATION_PCT*100:.0f}% | Stock {STOCK_ALLOCATION_PCT*100:.0f}%")
     lines.append(f"  Stops:    SL {STOP_LOSS_PCT*100:.0f}% | Trail {TRAILING_STOP_PCT*100:.0f}%")
-    lines.append(f"  Rebal:    every {REBALANCE_FREQUENCY_DAYS}d")
+    lines.append(f"  Rebal:    every {core_rebal_days}d")
     if core_pos:
         lines.append("  Positions:")
         for p in core_pos:

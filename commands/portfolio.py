@@ -1,5 +1,5 @@
-from core.alpaca import sync as alpaca_sync
 from core.auth import auth
+from core.quant import sync_state, get_config
 from core.runner import run_and_send
 
 COMMAND = "portfolio"
@@ -53,7 +53,6 @@ def _build_lines(snap_and_config):
 @auth
 async def handler(update, context):
     def _work():
-        import config
-        return alpaca_sync(), config
+        return sync_state(), get_config()
 
     await run_and_send(update, "Syncing from Alpaca...", _work, _build_lines)

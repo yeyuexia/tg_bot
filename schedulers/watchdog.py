@@ -7,7 +7,7 @@ from typing import Optional
 
 import pytz
 
-from core.alpaca import sync as alpaca_sync
+from core.quant import sync_state as alpaca_sync, get_config, run_alert_checks
 from core.config import TELEGRAM_USER_ID
 
 et = pytz.timezone("US/Eastern")
@@ -27,11 +27,7 @@ last_error: Optional[str] = None
 
 
 def _build_portfolio_and_alerts(snap):
-    import config
-    from watchdog import (
-        check_price_moves, check_volume,
-        check_macro_shift, check_news, check_rebalance,
-    )
+    cfg = get_config()
 
     portfolio = {
         "positions": [
@@ -44,19 +40,13 @@ def _build_portfolio_and_alerts(snap):
             for p in snap.positions
         ],
         "cash": snap.cash,
-        "initial_capital": config.INITIAL_CAPITAL,
+        "initial_capital": cfg.INITIAL_CAPITAL,
     }
 
     if not portfolio["positions"]:
         return None
 
-    all_alerts = []
-    all_alerts.extend(check_price_moves(portfolio))
-    all_alerts.extend(check_volume(portfolio))
-    macro_alerts, macro_result = check_macro_shift()
-    all_alerts.extend(macro_alerts)
-    all_alerts.extend(check_news(portfolio))
-    all_alerts.extend(check_rebalance(portfolio))
+    all_alerts, macro_result = run_alert_checks(portfolio)
 
     pos_by_ticker = {
         p["symbol"]: {
@@ -72,8 +62,8 @@ def _build_portfolio_and_alerts(snap):
         for p in snap.positions
     }
     total_value   = snap.equity
-    total_pnl     = snap.equity - config.INITIAL_CAPITAL
-    total_pnl_pct = total_pnl / config.INITIAL_CAPITAL * 100
+    total_pnl     = snap.equity - cfg.INITIAL_CAPITAL
+    total_pnl_pct = total_pnl / cfg.INITIAL_CAPITAL * 100
     cash          = snap.cash
     return portfolio, all_alerts, pos_by_ticker, macro_result, total_value, total_pnl, total_pnl_pct, cash
 
@@ -122,7 +112,7 @@ def _build_message(portfolio, all_alerts, pos_by_ticker,
                     direction = "recovering" if "+" in msg else "falling"
                     lines.append(f"  >> Large move — monitor closely, price {direction}")
                 elif "Regime change" in msg:
-                    lines.append("  >> Action: Re-run system: python3 run.py")
+                    lines.append("  >> Action: Re-run system: python3 -m quant.app.daily_report")
                 elif "SAHM RULE" in msg:
                     lines.append("  >> Recession signal — reduce equity exposure, increase cash/bonds")
                 elif "Yield curve" in msg:
